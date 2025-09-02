@@ -18,6 +18,7 @@ import (
 	"sort"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -196,5 +197,90 @@ func TestGVKMapsResolveGVK(t *testing.T) {
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("testcase: %s: got %v, want %v", tc.desc, got, tc.want)
 		}
+	}
+}
+
+func TestShouldSkipAPIService(t *testing.T) {
+	discoverer := &CRDiscoverer{}
+
+	testCases := []struct {
+		name     string
+		status   map[string]interface{}
+		expected bool
+	}{
+		{
+			name: "should skip unavailable APIService",
+			status: map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":   "Available",
+						"status": "False",
+						"reason": "ServiceUnavailable",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "should skip local APIService",
+			status: map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":   "Available",
+						"status": "True",
+						"reason": "Local",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "should not skip available non-local APIService",
+			status: map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":   "Available",
+						"status": "True",
+						"reason": "Passed",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name:     "should not skip APIService with no status",
+			status:   nil,
+			expected: false,
+		},
+		{
+			name: "should not skip APIService with no conditions",
+			status: map[string]interface{}{
+				"conditions": nil,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiServiceObject := map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"name": "test-apiservice",
+				},
+			}
+
+			if tc.status != nil {
+				apiServiceObject["status"] = tc.status
+			}
+
+			apiService := &unstructured.Unstructured{
+				Object: apiServiceObject,
+			}
+
+			result := discoverer.shouldSkipAPIService(apiService)
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
 	}
 }

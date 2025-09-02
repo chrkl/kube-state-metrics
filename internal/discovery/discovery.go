@@ -21,6 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
@@ -38,8 +39,36 @@ import (
 const Interval = 3 * time.Second
 
 // StartDiscovery starts the discovery process, fetching all the objects that can be listed from the apiserver, every `Interval` seconds.
+// This includes both CustomResourceDefinitions and APIServices for aggregated APIs.
 // resolveGVK needs to be called after StartDiscovery to generate factories.
 func (r *CRDiscoverer) StartDiscovery(ctx context.Context, config *rest.Config) error {
+	// Store the config for later use
+	r.config = config
+
+	// Initialize discovery client
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	r.discoveryClient = discoveryClient
+
+	// Start CRD discovery
+	err = r.startCRDDiscovery(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to start CRD discovery: %w", err)
+	}
+
+	// Start APIService discovery
+	err = r.startAPIServiceDiscovery(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to start APIService discovery: %w", err)
+	}
+
+	return nil
+}
+
+// startCRDDiscovery starts discovery for CustomResourceDefinitions
+func (r *CRDiscoverer) startCRDDiscovery(ctx context.Context, config *rest.Config) error {
 	client := dynamic.NewForConfigOrDie(config)
 	factory := dynamicinformer.NewFilteredDynamicInformer(client, schema.GroupVersionResource{
 		Group:    "apiextensions.k8s.io",
@@ -106,13 +135,170 @@ func (r *CRDiscoverer) StartDiscovery(ctx context.Context, config *rest.Config) 
 	// Respect context cancellation.
 	go func() {
 		for range ctx.Done() {
-			klog.InfoS("context cancelled, stopping discovery")
+			klog.InfoS("context cancelled, stopping CRD discovery")
 			close(stopper)
 			return
 		}
 	}()
 	go informer.Run(stopper)
 	return nil
+}
+
+// startAPIServiceDiscovery starts discovery for APIServices (aggregated APIs)
+func (r *CRDiscoverer) startAPIServiceDiscovery(ctx context.Context, config *rest.Config) error {
+	client := dynamic.NewForConfigOrDie(config)
+	factory := dynamicinformer.NewFilteredDynamicInformer(client, schema.GroupVersionResource{
+		Group:    "apiregistration.k8s.io",
+		Version:  "v1",
+		Resource: "apiservices",
+	}, "", 0, nil, nil)
+	informer := factory.Informer()
+	stopper := make(chan struct{})
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			r.processAPIServiceAdd(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			r.processAPIServiceDelete(obj)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	// Respect context cancellation.
+	go func() {
+		for range ctx.Done() {
+			klog.InfoS("context cancelled, stopping APIService discovery")
+			close(stopper)
+			return
+		}
+	}()
+	go informer.Run(stopper)
+	return nil
+}
+
+// processAPIServiceAdd handles the addition of an APIService resource
+func (r *CRDiscoverer) processAPIServiceAdd(obj interface{}) {
+	apiService := obj.(*unstructured.Unstructured)
+	name := apiService.GetName()
+	spec := apiService.Object["spec"].(map[string]interface{})
+
+	// Skip core API services and unavailable services
+	if r.shouldSkipAPIService(apiService) {
+		return
+	}
+
+	group := spec["group"].(string)
+	version := spec["version"].(string)
+
+	// Discover the actual resources provided by this APIService
+	r.discoverAPIServiceResources(group, version)
+
+	r.SafeWrite(func() {
+		klog.InfoS("Discovered APIService", "apiService", name, "group", group, "version", version)
+		r.APIServicesAddEventsCounter.Inc()
+		r.APIServicesCacheCountGauge.Inc()
+		r.WasUpdated = true
+	})
+}
+
+// discoverAPIServiceResources discovers the resources provided by an APIService
+func (r *CRDiscoverer) discoverAPIServiceResources(group, version string) {
+	if r.discoveryClient == nil {
+		klog.InfoS("Discovery client not available, skipping resource discovery", "group", group, "version", version)
+		return
+	}
+
+	// Get the resources for this group/version
+	resourceList, err := r.discoveryClient.ServerResourcesForGroupVersion(group + "/" + version)
+	if err != nil {
+		klog.ErrorS(err, "Failed to discover resources for APIService", "group", group, "version", version)
+		return
+	}
+
+	// Add each resource to our cache
+	for _, resource := range resourceList.APIResources {
+		// Skip subresources (those with '/' in the name)
+		if len(resource.Name) == 0 || resource.Name[0] == '/' {
+			continue
+		}
+
+		gvkp := groupVersionKindPlural{
+			GroupVersionKind: schema.GroupVersionKind{
+				Group:   group,
+				Version: version,
+				Kind:    resource.Kind,
+			},
+			Plural: resource.Name,
+		}
+
+		r.SafeWrite(func() {
+			r.AppendToMap(gvkp)
+		})
+	}
+}
+
+// processAPIServiceDelete handles the deletion of an APIService resource
+func (r *CRDiscoverer) processAPIServiceDelete(obj interface{}) {
+	apiService := obj.(*unstructured.Unstructured)
+	name := apiService.GetName()
+	spec := apiService.Object["spec"].(map[string]interface{})
+
+	// Skip core API services and unavailable services
+	if r.shouldSkipAPIService(apiService) {
+		return
+	}
+
+	group := spec["group"].(string)
+	version := spec["version"].(string)
+
+	// Remove all resources for this APIService from our cache
+	r.SafeWrite(func() {
+		if groupMap, exists := r.Map[group]; exists {
+			if _, versionExists := groupMap[version]; versionExists {
+				// Remove all kinds for this group/version
+				for _, kp := range groupMap[version] {
+					gvkp := groupVersionKindPlural{
+						GroupVersionKind: schema.GroupVersionKind{
+							Group:   group,
+							Version: version,
+							Kind:    kp.Kind,
+						},
+						Plural: kp.Plural,
+					}
+					r.RemoveFromMap(gvkp)
+				}
+			}
+		}
+
+		klog.InfoS("APIService deleted", "apiService", name, "group", group, "version", version)
+		r.APIServicesDeleteEventsCounter.Inc()
+		r.APIServicesCacheCountGauge.Dec()
+		r.WasUpdated = true
+	})
+}
+
+// shouldSkipAPIService determines if an APIService should be skipped
+func (r *CRDiscoverer) shouldSkipAPIService(apiService *unstructured.Unstructured) bool {
+	status := apiService.Object["status"]
+	if status != nil {
+		conditions := status.(map[string]interface{})["conditions"]
+		if conditions != nil {
+			for _, condition := range conditions.([]interface{}) {
+				cond := condition.(map[string]interface{})
+
+				if cond["type"].(string) == "Available" && cond["status"].(string) != "True" {
+					return true
+				}
+
+				if cond["reason"].(string) == "Local" && cond["status"].(string) == "True" {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 // ResolveGVKToGVKPs resolves the variable VKs to a GVK list, based on the current cache.

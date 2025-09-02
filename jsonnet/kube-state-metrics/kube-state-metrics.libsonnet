@@ -163,6 +163,13 @@
         ],
         verbs: ['list', 'watch'],
       },
+      {
+        apiGroups: ['apiregistration.k8s.io'],
+        resources: [
+          'apiservices',
+        ],
+        verbs: ['list', 'watch'],
+      },
     ];
 
     {

@@ -19,6 +19,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/rest"
 )
 
 type groupVersionKindPlural struct {
@@ -35,7 +37,7 @@ type kindPlural struct {
 	Plural string
 }
 
-// CRDiscoverer provides a cache of the collected GVKs, along with helper utilities.
+// CRDiscoverer provides a cache of the collected GVKs from both CRDs and APIServices, along with helper utilities.
 type CRDiscoverer struct {
 	// CRDsAddEventsCounter tracks the number of times that the CRD informer triggered the "add" event.
 	CRDsAddEventsCounter prometheus.Counter
@@ -43,6 +45,12 @@ type CRDiscoverer struct {
 	CRDsDeleteEventsCounter prometheus.Counter
 	// CRDsCacheCountGauge tracks the net amount of CRDs affecting the cache at this point.
 	CRDsCacheCountGauge prometheus.Gauge
+	// APIServicesAddEventsCounter tracks the number of times that the APIService informer triggered the "add" event.
+	APIServicesAddEventsCounter prometheus.Counter
+	// APIServicesDeleteEventsCounter tracks the number of times that the APIService informer triggered the "remove" event.
+	APIServicesDeleteEventsCounter prometheus.Counter
+	// APIServicesCacheCountGauge tracks the net amount of APIServices affecting the cache at this point.
+	APIServicesCacheCountGauge prometheus.Gauge
 	// Map is a cache of the collected GVKs.
 	Map map[string]map[string][]kindPlural
 	// GVKToReflectorStopChanMap is a map of GVKs to channels that can be used to stop their corresponding reflector.
@@ -51,6 +59,10 @@ type CRDiscoverer struct {
 	m sync.RWMutex
 	// ShouldUpdate is a flag that indicates whether the cache was updated.
 	WasUpdated bool
+	// discoveryClient is used to discover resources from APIServices
+	discoveryClient discovery.DiscoveryInterface
+	// config is the rest config used for creating clients
+	config *rest.Config
 }
 
 // SafeRead executes the given function while holding a read lock.

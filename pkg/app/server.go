@@ -123,6 +123,18 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 		Name: "kube_state_metrics_custom_resource_state_cache",
 		Help: "Net amount of CRDs affecting the cache currently.",
 	})
+	apiServicesAddEventsCounter := promauto.With(ksmMetricsRegistry).NewCounter(prometheus.CounterOpts{
+		Name: "kube_state_metrics_api_service_add_events_total",
+		Help: "Number of times that the APIService informer triggered the add event.",
+	})
+	apiServicesDeleteEventsCounter := promauto.With(ksmMetricsRegistry).NewCounter(prometheus.CounterOpts{
+		Name: "kube_state_metrics_api_service_delete_events_total",
+		Help: "Number of times that the APIService informer triggered the remove event.",
+	})
+	apiServicesCacheCountGauge := promauto.With(ksmMetricsRegistry).NewGauge(prometheus.GaugeOpts{
+		Name: "kube_state_metrics_api_service_cache",
+		Help: "Net amount of APIServices affecting the cache currently.",
+	})
 	storeBuilder := store.NewBuilder()
 	storeBuilder.WithMetrics(ksmMetricsRegistry)
 	got := options.GetConfigFile(*opts)
@@ -306,13 +318,16 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 	// A nil CRS config implies that we need to hold off on all CRS operations.
 	if config != nil {
 		discovererInstance := &discovery.CRDiscoverer{
-			CRDsAddEventsCounter:    crdsAddEventsCounter,
-			CRDsDeleteEventsCounter: crdsDeleteEventsCounter,
-			CRDsCacheCountGauge:     crdsCacheCountGauge,
+			CRDsAddEventsCounter:           crdsAddEventsCounter,
+			CRDsDeleteEventsCounter:        crdsDeleteEventsCounter,
+			CRDsCacheCountGauge:            crdsCacheCountGauge,
+			APIServicesAddEventsCounter:    apiServicesAddEventsCounter,
+			APIServicesDeleteEventsCounter: apiServicesDeleteEventsCounter,
+			APIServicesCacheCountGauge:     apiServicesCacheCountGauge,
 		}
 		// storeBuilder starts reflectors for the discovered GVKs, and as such, should close them too.
 		storeBuilder.GVKToReflectorStopChanMap = &discovererInstance.GVKToReflectorStopChanMap
-		// This starts a goroutine that will watch for any new GVKs to extract from CRDs.
+		// This starts a goroutine that will watch for any new GVKs to extract from CRDs and APIServices.
 		err = discovererInstance.StartDiscovery(ctx, kubeConfig)
 		if err != nil {
 			return err
